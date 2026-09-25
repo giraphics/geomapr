@@ -1,0 +1,16 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.8",
+	"Category": "",
+	"Description": "2D Map Viewer - Phase 2: road segment rendering from SQLite",
+	"Modules": [
+		{
+			"Name": "MapViewerUnreal",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{ "Name": "SQLiteCore", "Enabled": true }
+	]
+}

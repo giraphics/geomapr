@@ -1,0 +1,19 @@
+# Unreal generated folders
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+Build/
+.vs/
+.idea/
+.vscode/
+
+# Generated IDE project files
+*.sln
+*.xcworkspace/
+*.xcodeproj/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
