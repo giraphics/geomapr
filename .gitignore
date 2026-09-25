@@ -1,19 +1,77 @@
-# Unreal generated folders
+# ---------------------------------------------------------------------------
+# Unreal Engine generated folders (rebuilt by build.bat / build.sh)
+# ---------------------------------------------------------------------------
 Binaries/
 Intermediate/
 DerivedDataCache/
 Saved/
 Build/
-.vs/
-.idea/
-.vscode/
+Plugins/*/Binaries/
+Plugins/*/Intermediate/
 
-# Generated IDE project files
+# Packaged game output
+Packaged/
+Archive/
+*.pak
+
+# ---------------------------------------------------------------------------
+# Generated IDE project files (recreate with GenerateProjectFiles)
+# ---------------------------------------------------------------------------
+# Visual Studio
 *.sln
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+.vs/
+
+# Xcode
 *.xcworkspace/
 *.xcodeproj/
-*.code-workspace
+xcuserdata/
+DerivedData/
 
-# OS
+# Rider / VS Code / CLion
+.idea/
+.vscode/
+*.code-workspace
+.vsconfig
+cmake-build-*/
+
+# ---------------------------------------------------------------------------
+# Compiled files
+# ---------------------------------------------------------------------------
+*.obj
+*.o
+*.pch
+*.pdb
+*.dll
+*.dylib
+*.so
+*.lib
+*.a
+*.exe
+*.app/
+*.dSYM/
+*.ipa
+*.apk
+
+# ---------------------------------------------------------------------------
+# SQLite temporary files (keep Data/map_extended.db itself)
+# ---------------------------------------------------------------------------
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ---------------------------------------------------------------------------
+# OS / editor clutter
+# ---------------------------------------------------------------------------
 .DS_Store
 Thumbs.db
+desktop.ini
+*.swp
+*~
+*.bak
+*.tmp
+*.log
