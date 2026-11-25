@@ -45,7 +45,7 @@ and the editor cannot open it. Run `git lfs pull` inside the repo to fetch it.
    is somewhere else, set `UE_ROOT` first:
 
    ```bat
-   set UE_ROOT=D:\Epic\UE_5.8
+   set UE_ROOT=C:\Program Files\Epic Games\UE_5.8
    build.bat
    ```
 

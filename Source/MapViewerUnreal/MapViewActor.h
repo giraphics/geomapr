@@ -70,7 +70,8 @@ struct FBuildingSection
  * each section receiving its own UMaterialInstanceDynamic so the colour is
  * set at runtime without a custom material asset.
  *
- * Roads and POI poles continue to use DrawDebugLine (unchanged from Phase 6).
+ * Roads are width-extruded ribbons in RoadMesh, batched one section per
+ * colour, over a flat GroundMesh quad. Only POI poles still use DrawDebugLine.
  */
 UCLASS()
 class MAPVIEWERUNREAL_API AMapViewActor : public AActor
@@ -91,6 +92,12 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Map")
 	FString DatabasePath;
+
+	// Point DatabasePath at a database that actually exists.  A path saved into
+	// a level can outlive the folder it referred to (or belong to another
+	// machine), and the only symptom is that nothing renders at all.  This
+	// falls back to the copy the project ships in Data/map_extended.db.
+	void EnsureDatabasePath();
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Map")
 	float LineThickness = 0.f;
@@ -128,6 +135,38 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Map")
 	UProceduralMeshComponent* BuildingMesh = nullptr;
 
+	// Roads as width-extruded ribbons (replaces DrawDebugLine)
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Map")
+	UProceduralMeshComponent* RoadMesh = nullptr;
+
+	// Flat ground quad so the map does not sit on a black void
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Map")
+	UProceduralMeshComponent* GroundMesh = nullptr;
+
+	// -- Appearance ---------------------------------------------------------
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Map|Appearance")
+	bool bShowGround = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Map|Appearance")
+	FLinearColor GroundColor = FLinearColor(0.28f, 0.29f, 0.30f);
+
+	// Half-extent of the ground quad, cm. Default 10 km, which stays well
+	// inside UE's ~21 km world bounds - a primitive whose bounds fall outside
+	// the world is dropped by the renderer instead of drawn.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Map|Appearance")
+	float GroundExtentCm = 1000000.f;
+
+	// Roads sit this far above z=0 so they never z-fight with the ground
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Map|Appearance")
+	float RoadZOffsetCm = 4.f;
+
+	// Diagnostic: also draw roads as debug lines on top of the ribbons.
+	// If lines appear but ribbons do not, the mesh component is the problem,
+	// not the data. Turn off once the ribbons are confirmed working.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Map|Appearance")
+	bool bDebugRoadLines = true;
+
 	// ── Read-only stats ────────────────────────────────────────────────────
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Map|Stats")
@@ -163,7 +202,18 @@ private:
 	void QueryAndStorePOIs(double MinLon, double MaxLon, double MinLat, double MaxLat);
 
 	// Redraw roads + POIs via DrawDebugLine; rebuild BuildingMesh sections.
-	void RedrawAll(float AltitudeM);
+	// bDataChanged=false means only the LOD moved: roads just change section
+	// visibility, nothing is rebuilt.
+	void RedrawAll(float AltitudeM, bool bDataChanged = true);
+
+	// Toggle road mesh sections by class instead of rebuilding geometry.
+	void ApplyRoadLod(float AltM);
+
+	// Rebuild roads as coloured ribbons from CachedRows.
+	void RebuildRoadMesh(float AltitudeM);
+
+	// Rebuild the flat ground quad.
+	void RebuildGroundPlane();
 
 	// Rebuild the ProceduralMeshComponent from CachedBuildings.
 	// Called from RedrawAll when buildings are visible.
@@ -175,6 +225,10 @@ private:
 
 	// Road LOD helpers
 	static FColor RoadTypeColor(const FString& Type);
+	// Ribbon width in cm by highway type.
+	static float  RoadWidthCm(const FString& Type);
+	// Road class 0-3; mirrors IsTypeVisible's tiers. Class <= Lod means visible.
+	static int32  RoadClassOf(const FString& RawType);
 	int32 LodLevel(float AltM) const;
 	bool  IsTypeVisible(const FString& Type, float AltM) const;
 
@@ -196,6 +250,12 @@ private:
 	float  LastQueryAltitudeM = 0.f;
 	float  LastDrawAltitudeM  = -1.f;
 	TArray<FRoadRow> CachedRows;
+
+	// Road class of each RoadMesh section, parallel to section index.
+	TArray<int32> RoadSectionClass;
+
+	// The ground quad is static; build it once.
+	bool bGroundBuilt = false;
 
 	// ── Building dirty-flag cache ──────────────────────────────────────────
 	double BldCacheMinLon = 0.0, BldCacheMaxLon = 0.0;

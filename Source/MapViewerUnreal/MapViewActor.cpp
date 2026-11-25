@@ -6,6 +6,8 @@
 #include "GameFramework/PlayerController.h"
 #include "KismetProceduralMeshLibrary.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "HAL/PlatformFileManager.h"
+#include "Misc/Paths.h"
 
 // ---------------------------------------------------------------------------
 // Road type → colour
@@ -25,6 +27,62 @@ FColor AMapViewActor::RoadTypeColor(const FString& Type)
     if (Type == TEXT("living_street")) return FColor(140, 181, 140);
     if (Type == TEXT("steps"))         return FColor(161, 120,  79);
     return                                    FColor( 99,  99,  99);
+}
+
+// ---------------------------------------------------------------------------
+// RoadWidthCm - ribbon width by highway type, in centimetres.
+// Wider classes read first when zoomed out, which is what gives the map its
+// visual hierarchy. Footpaths stay thin so they never dominate.
+// ---------------------------------------------------------------------------
+float AMapViewActor::RoadWidthCm(const FString& Type)
+{
+    if (Type == TEXT("footway") || Type == TEXT("path") ||
+        Type == TEXT("steps")   || Type == TEXT("cycleway"))  return 200.f;
+    if (Type.StartsWith(TEXT("motorway")))                    return 1200.f;
+    if (Type.StartsWith(TEXT("trunk")))                       return 1000.f;
+    if (Type.StartsWith(TEXT("primary")))                     return 900.f;
+    if (Type.StartsWith(TEXT("secondary")))                   return 800.f;
+    if (Type.StartsWith(TEXT("tertiary")))                    return 700.f;
+    if (Type == TEXT("residential"))                          return 600.f;
+    if (Type == TEXT("living_street"))                        return 500.f;
+    if (Type == TEXT("unclassified"))                         return 500.f;
+    if (Type == TEXT("service"))                              return 400.f;
+    if (Type == TEXT("track"))                                return 300.f;
+    return                                                           450.f;
+}
+
+// ---------------------------------------------------------------------------
+// RoadClassOf - the tiers IsTypeVisible encodes, as a number.
+// A section of class C is visible when C <= LodLevel(altitude).
+// ---------------------------------------------------------------------------
+int32 AMapViewActor::RoadClassOf(const FString& RawType)
+{
+    // A "_link" road is a ramp or slip road of the type before it, so
+    // "secondary_link" ranks with "secondary" rather than falling to class 3.
+    const FString Type = RawType.EndsWith(TEXT("_link")) ? RawType.LeftChop(5) : RawType;
+
+    if (Type == TEXT("motorway") || Type == TEXT("trunk")) return 0;
+    if (Type == TEXT("primary")  || Type == TEXT("secondary")) return 1;
+    if (Type == TEXT("tertiary")     || Type == TEXT("residential") ||
+        Type == TEXT("unclassified") || Type == TEXT("living_street")) return 2;
+    return 3;
+}
+
+// ---------------------------------------------------------------------------
+// ApplyRoadLod - show/hide whole sections. No geometry is rebuilt, so zooming
+// costs a handful of visibility flags rather than a full mesh regeneration.
+// ---------------------------------------------------------------------------
+void AMapViewActor::ApplyRoadLod(float AltM)
+{
+    const int32 Lod = LodLevel(AltM);
+    int32 Visible = 0;
+    for (int32 i = 0; i < RoadSectionClass.Num(); ++i)
+    {
+        const bool bOn = (RoadSectionClass[i] <= Lod);
+        RoadMesh->SetMeshSectionVisible(i, bOn);
+        if (bOn) ++Visible;
+    }
+    DrawnSegmentCount = Visible;
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +302,27 @@ AMapViewActor::AMapViewActor()
     BuildingMesh->SetupAttachment(RootComponent);
     BuildingMesh->bUseAsyncCooking = false;   // synchronous so mesh is ready immediately
 
+    // Roads: flat coloured ribbons on the ground. Flat things need no shadow.
+    RoadMesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("RoadMesh"));
+    RoadMesh->SetupAttachment(RootComponent);
+    RoadMesh->bUseAsyncCooking = false;
+    RoadMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    RoadMesh->SetCanEverAffectNavigation(false);
+    RoadMesh->SetCastShadow(false);
+
+    // Ground: one large quad so the map never reads against a black void.
+    GroundMesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("GroundMesh"));
+    GroundMesh->SetupAttachment(RootComponent);
+    GroundMesh->bUseAsyncCooking = false;
+    GroundMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    GroundMesh->SetCanEverAffectNavigation(false);
+    GroundMesh->SetCastShadow(false);
+
+    // Buildings are the only things with volume, so they alone cast shadows.
+    BuildingMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    BuildingMesh->SetCanEverAffectNavigation(false);
+    BuildingMesh->SetCastShadow(true);
+
     // BasicShapeMaterial exposes a "Color" vector parameter used by
     // UMaterialInstanceDynamic::SetVectorParameterValue at runtime.
     static ConstructorHelpers::FObjectFinder<UMaterial> MatFinder(
@@ -264,6 +343,7 @@ void AMapViewActor::OnConstruction(const FTransform& Transform)
 {
     Super::OnConstruction(Transform);
 
+    EnsureDatabasePath();
     if (DatabasePath.IsEmpty()) return;
 
     // Re-initialise from scratch so a DatabasePath change takes effect immediately.
@@ -271,6 +351,11 @@ void AMapViewActor::OnConstruction(const FTransform& Transform)
     bNeedsRefresh    = true;
     bBldNeedsRefresh = true;
     bPoiNeedsRefresh = true;
+
+    // Components added to this class after the actor was saved into the level
+    // can come back unregistered: invisible, while older components still draw.
+    if (RoadMesh   && !RoadMesh->IsRegistered())   RoadMesh->RegisterComponent();
+    if (GroundMesh && !GroundMesh->IsRegistered()) GroundMesh->RegisterComponent();
 
     if (!InitRefOrigin()) return;
 
@@ -314,6 +399,7 @@ void AMapViewActor::BeginPlay()
 {
     Super::BeginPlay();
 
+    EnsureDatabasePath();
     if (DatabasePath.IsEmpty())
     {
         UE_LOG(LogTemp, Warning, TEXT("MapViewActor: DatabasePath not set."));
@@ -344,6 +430,7 @@ void AMapViewActor::Tick(float DeltaTime)
     Super::Tick(DeltaTime);
 
     // Editor mode: BeginPlay never fires, so initialize here on first tick.
+    if (!bRefInitialised) EnsureDatabasePath();
     if (!bRefInitialised && !DatabasePath.IsEmpty())
     {
         if (InitRefOrigin())
@@ -395,6 +482,7 @@ void AMapViewActor::Tick(float DeltaTime)
                              VMaxLat > PoiCacheMaxLat;
 
     bool bAnyDirty = false;
+    bool bLodOnly  = false;
 
     // ── Re-query dirty layers ───────────────────────────────────────────────
 
@@ -420,7 +508,7 @@ void AMapViewActor::Tick(float DeltaTime)
     }
     else if (bLodChanged)
     {
-        bAnyDirty = true;
+        bLodOnly = true;
     }
 
     if (bBldVisible && (bBldOutside || bBldThresholdCrossed))
@@ -472,6 +560,15 @@ void AMapViewActor::Tick(float DeltaTime)
         bAnyDirty = true;
     }
 
+    if (!bAnyDirty && bLodOnly)
+    {
+        const double T0 = FPlatformTime::Seconds();
+        ApplyRoadLod(CurrentAlt);
+        UE_LOG(LogTemp, Log, TEXT("Phase6_PM: lod-only  %.2f ms  lod=%d  alt=%.0f m"),
+            (FPlatformTime::Seconds() - T0) * 1000.0, LodLevel(CurrentAlt), (double)CurrentAlt);
+        LastDrawAltitudeM = CurrentAlt;
+    }
+
     if (bAnyDirty)
     {
         const double T0 = FPlatformTime::Seconds();
@@ -493,6 +590,45 @@ void AMapViewActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     FlushPersistentDebugLines(GetWorld());
     Super::EndPlay(EndPlayReason);
+}
+
+// ---------------------------------------------------------------------------
+// EnsureDatabasePath
+// ---------------------------------------------------------------------------
+void AMapViewActor::EnsureDatabasePath()
+{
+    IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
+
+    if (!DatabasePath.IsEmpty() && PF.FileExists(*DatabasePath))
+        return;                                  // already usable
+
+    const FString Shipped = FPaths::ConvertRelativePathToFull(
+        FPaths::ProjectDir() / TEXT("Data/map_extended.db"));
+
+    if (PF.FileExists(*Shipped))
+    {
+        if (DatabasePath.IsEmpty())
+        {
+            UE_LOG(LogTemp, Log,
+                TEXT("MapViewActor: DatabasePath unset, using project database %s"),
+                *Shipped);
+        }
+        else
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("MapViewActor: DatabasePath %s does not exist; ")
+                TEXT("falling back to project database %s"),
+                *DatabasePath, *Shipped);
+        }
+        DatabasePath = Shipped;
+    }
+    else
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("MapViewActor: no usable database. DatabasePath=%s and the ")
+            TEXT("project copy %s are both missing."),
+            DatabasePath.IsEmpty() ? TEXT("(empty)") : *DatabasePath, *Shipped);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +1028,22 @@ void AMapViewActor::RebuildBuildingMesh()
         // Map ear-clipping indices (0..N-1) to section-global indices
         for (int32 Idx : RoofTris)
             Sec.Triangles.Add(RoofBase + Idx);
+
+        // Back-face (reversed winding) - same approach as the wall quads above.
+        // Triangulate2D emits triangles in the polygon's own winding order, and
+        // OSM footprints arrive in both windings, so a single-sided roof faces
+        // downward for roughly half of all buildings and is invisible from the
+        // air. Emitting both orientations makes the roof visible regardless.
+        const int32 RoofBackBase = Sec.Vertices.Num();
+        for (const FVector& N2 : Nodes)
+            Sec.Vertices.Add(FVector(N2.X, N2.Y, ZTop)), Sec.Normals.Add(-RoofNormal);
+
+        for (int32 k = 0; k + 2 < RoofTris.Num(); k += 3)
+        {
+            Sec.Triangles.Add(RoofBackBase + RoofTris[k + 2]);
+            Sec.Triangles.Add(RoofBackBase + RoofTris[k + 1]);
+            Sec.Triangles.Add(RoofBackBase + RoofTris[k + 0]);
+        }
     };
 
     for (const FBuildingRow& Row : CachedBuildings)
@@ -951,54 +1103,206 @@ void AMapViewActor::ClearBuildingMesh()
 }
 
 // ---------------------------------------------------------------------------
-// RedrawAll — roads + POIs via DrawDebugLine; buildings via ProceduralMesh.
+// RedrawAll — ground + roads + buildings as meshes; POIs via DrawDebugLine.
 //
-// Roads and POIs still use DrawDebugLine (flushed + redrawn together as in
-// Phase 6).  Buildings are handled by RebuildBuildingMesh() which writes into
+// Roads are now ribbons in RoadMesh; only POIs still use DrawDebugLine.
+// Buildings are handled by RebuildBuildingMesh() which writes into
 // the persistent UProceduralMeshComponent — no flush needed for the mesh.
 // ---------------------------------------------------------------------------
-void AMapViewActor::RedrawAll(float AltitudeM)
+// ---------------------------------------------------------------------------
+// RebuildGroundPlane - one large flat quad under everything.
+//
+// Without this the map floats on the renderer's clear colour, which reads as
+// a black void and blows out the white building faces by contrast.
+// ---------------------------------------------------------------------------
+void AMapViewActor::RebuildGroundPlane()
 {
-    // ── 1. Roads (DrawDebugLine, same as Phase 6) ─────────────────────────
-    FlushPersistentDebugLines(GetWorld());
+    if (bGroundBuilt && bShowGround) return;   // static quad, build once
+    GroundMesh->ClearAllMeshSections();
+    bGroundBuilt = false;
+    if (!bShowGround) return;
 
+    const float Z = -GetActorLocation().Z;   // local z such that world z = 0
+    const float E = GroundExtentCm;
+
+    TArray<FVector> V {
+        FVector(-E, -E, Z), FVector( E, -E, Z),
+        FVector( E,  E, Z), FVector(-E,  E, Z) };
+    TArray<FVector> N; N.Init(FVector(0.f, 0.f, 1.f), 4);
+    TArray<int32>   T { 0,1,2, 0,2,3, 0,2,1, 0,3,2 };   // both windings, as the walls do
+
+    GroundMesh->CreateMeshSection(0, V, T, N, TArray<FVector2D>(),
+                                  TArray<FColor>(), TArray<FProcMeshTangent>(), false);
+
+    if (BuildingBaseMaterial)
     {
-        int32  PrevRoadId = -1;
-        double PrevLat = 0.0, PrevLon = 0.0;
-        FColor PrevColor = FColor::White;
-        bool   PrevVis   = false;
-        int32  Drawn = 0, Total = 0;
+        UMaterialInstanceDynamic* Mat = UMaterialInstanceDynamic::Create(BuildingBaseMaterial, this);
+        Mat->SetVectorParameterValue(TEXT("Color"), GroundColor);
+        GroundMesh->SetMaterial(0, Mat);
+    }
+    bGroundBuilt = true;
+}
 
-        for (const FRoadRow& Row : CachedRows)
+// ---------------------------------------------------------------------------
+// RebuildRoadMesh - roads as width-extruded ribbons instead of debug lines.
+//
+// Each segment becomes a quad of RoadWidthCm(type) width, lying flat at
+// RoadZOffsetCm above the ground. Segments are batched by colour into one
+// mesh section per colour, the same pattern RebuildBuildingMesh uses, so the
+// whole road network costs one draw call per road colour.
+//
+// Both windings are emitted, matching the two-sided building walls, so the
+// ribbons are visible from above and below without a two-sided material.
+// ---------------------------------------------------------------------------
+void AMapViewActor::RebuildRoadMesh(float AltitudeM)
+{
+    RoadMesh->ClearAllMeshSections();
+    if (CachedRows.Num() == 0) { DrawnSegmentCount = 0; TotalSegmentCount = 0; return; }
+
+    const float Z  = RoadZOffsetCm - GetActorLocation().Z;
+    const FVector Up(0.f, 0.f, 1.f);
+
+    // Key by (class, colour) so a LOD change can hide whole sections.
+    TMap<uint64, FBuildingSection> Groups;
+    TMap<uint64, int32>            GroupClass;
+    auto GroupKey = [](int32 Cls, const FLinearColor& C) -> uint64 {
+        return (uint64(Cls) << 32) |
+               (uint32(C.R * 255) << 16) | (uint32(C.G * 255) << 8) | uint32(C.B * 255);
+    };
+
+    int32   Drawn = 0, Total = 0;
+    int32   PrevRoadId = -1;
+    double  PrevLat = 0.0, PrevLon = 0.0;
+    FString PrevType;
+    bool    PrevVis = false;
+
+    for (const FRoadRow& Row : CachedRows)
+    {
+        // Geometry for every class is built once; ApplyRoadLod decides what shows.
+        const bool bVis = true;
+        if (Row.RoadId == PrevRoadId)
         {
-            const bool bVis = IsTypeVisible(Row.HighwayType, AltitudeM);
-            if (Row.RoadId == PrevRoadId)
+            ++Total;
+            if (PrevVis && bVis)
             {
-                ++Total;
-                if (PrevVis && bVis)
+                // UE5: X = North (Lat), Y = East (Lon)
+                const float px = (float)((PrevLat - RefLat) * MetresPerDegLat * 100.0);
+                const float py = (float)((PrevLon - RefLon) * MetresPerDegLon * 100.0);
+                const float wx = (float)((Row.Lat  - RefLat) * MetresPerDegLat * 100.0);
+                const float wy = (float)((Row.Lon  - RefLon) * MetresPerDegLon * 100.0);
+
+                FVector Dir(wx - px, wy - py, 0.f);
+                if (!Dir.IsNearlyZero())
                 {
-                    // UE5: X = North (Lat), Y = East (Lon)
-                    const float px = (float)((PrevLat - RefLat) * MetresPerDegLat * 100.0);
-                    const float py = (float)((PrevLon - RefLon) * MetresPerDegLon * 100.0);
-                    const float wx = (float)((Row.Lat  - RefLat) * MetresPerDegLat * 100.0);
-                    const float wy = (float)((Row.Lon  - RefLon) * MetresPerDegLon * 100.0);
-                    DrawDebugLine(GetWorld(),
-                        FVector(px, py, 0.f), FVector(wx, wy, 0.f),
-                        PrevColor, true, -1.f, 0, LineThickness);
+                    Dir = Dir.GetSafeNormal();
+                    const FVector Side(-Dir.Y, Dir.X, 0.f);
+                    const float   Half = RoadWidthCm(PrevType) * 0.5f;
+
+                    const FColor C8 = RoadTypeColor(PrevType);
+                    const FLinearColor C(C8.R / 255.f, C8.G / 255.f, C8.B / 255.f);
+
+                    const int32  Cls = RoadClassOf(PrevType);
+                    const uint64 Key = GroupKey(Cls, C);
+                    FBuildingSection& Sec = Groups.FindOrAdd(Key);
+                    Sec.Color = C;
+                    GroupClass.FindOrAdd(Key) = Cls;
+
+                    const FVector A(px, py, Z), B(wx, wy, Z);
+                    const int32 Base = Sec.Vertices.Num();
+                    Sec.Vertices.Add(A + Side * Half); Sec.Normals.Add(Up);
+                    Sec.Vertices.Add(B + Side * Half); Sec.Normals.Add(Up);
+                    Sec.Vertices.Add(B - Side * Half); Sec.Normals.Add(Up);
+                    Sec.Vertices.Add(A - Side * Half); Sec.Normals.Add(Up);
+
+                    Sec.Triangles.Add(Base+0); Sec.Triangles.Add(Base+1); Sec.Triangles.Add(Base+2);
+                    Sec.Triangles.Add(Base+0); Sec.Triangles.Add(Base+2); Sec.Triangles.Add(Base+3);
+                    Sec.Triangles.Add(Base+0); Sec.Triangles.Add(Base+2); Sec.Triangles.Add(Base+1);
+                    Sec.Triangles.Add(Base+0); Sec.Triangles.Add(Base+3); Sec.Triangles.Add(Base+2);
                     ++Drawn;
                 }
             }
-            PrevRoadId = Row.RoadId;
-            PrevLat    = Row.Lat;
-            PrevLon    = Row.Lon;
-            PrevColor  = RoadTypeColor(Row.HighwayType);
-            PrevVis    = bVis;
         }
-        DrawnSegmentCount = Drawn;
-        TotalSegmentCount = Total;
+        PrevRoadId = Row.RoadId;
+        PrevLat    = Row.Lat;
+        PrevLon    = Row.Lon;
+        PrevType   = Row.HighwayType;
+        PrevVis    = bVis;
     }
 
-    // ── 2. Buildings (ProceduralMesh — filled solid triangles) ───────────
+    DrawnSegmentCount = Drawn;
+    TotalSegmentCount = Total;
+
+    UE_LOG(LogTemp, Log,
+        TEXT("RebuildRoadMesh: rows=%d drawn=%d total=%d colourGroups=%d alt=%.0fm mat=%s"),
+        CachedRows.Num(), Drawn, Total, Groups.Num(), (double)AltitudeM,
+        BuildingBaseMaterial ? TEXT("ok") : TEXT("NULL"));
+
+    RoadSectionClass.Reset();
+    int32 SectionIdx = 0;
+    for (auto& Pair : Groups)
+    {
+        FBuildingSection& Sec = Pair.Value;
+        RoadSectionClass.Add(GroupClass[Pair.Key]);
+        RoadMesh->CreateMeshSection(SectionIdx, Sec.Vertices, Sec.Triangles, Sec.Normals,
+                                    TArray<FVector2D>(), TArray<FColor>(),
+                                    TArray<FProcMeshTangent>(), false);
+        if (BuildingBaseMaterial)
+        {
+            UMaterialInstanceDynamic* Mat = UMaterialInstanceDynamic::Create(BuildingBaseMaterial, this);
+            Mat->SetVectorParameterValue(TEXT("Color"), Sec.Color);
+            RoadMesh->SetMaterial(SectionIdx, Mat);
+        }
+        ++SectionIdx;
+    }
+
+    ApplyRoadLod(AltitudeM);
+
+    // Diagnostic overlay - the same segments as thick debug lines, 3 m up.
+    // Lines but no ribbons => the mesh component is the problem, not the data.
+    if (bDebugRoadLines)
+    {
+        int32   Lines  = 0;
+        int32   PrevId = -1;
+        double  PLat = 0.0, PLon = 0.0;
+        FString PType;
+        for (const FRoadRow& Row : CachedRows)
+        {
+            if (Row.RoadId == PrevId)
+            {
+                const float px = (float)((PLat - RefLat) * MetresPerDegLat * 100.0);
+                const float py = (float)((PLon - RefLon) * MetresPerDegLon * 100.0);
+                const float wx = (float)((Row.Lat - RefLat) * MetresPerDegLat * 100.0);
+                const float wy = (float)((Row.Lon - RefLon) * MetresPerDegLon * 100.0);
+                DrawDebugLine(GetWorld(), FVector(px, py, 300.f), FVector(wx, wy, 300.f),
+                              RoadTypeColor(PType), true, -1.f, 0, 300.f);
+                ++Lines;
+            }
+            PrevId = Row.RoadId; PLat = Row.Lat; PLon = Row.Lon; PType = Row.HighwayType;
+        }
+        UE_LOG(LogTemp, Warning,
+               TEXT("RoadDiag: debugLines=%d meshSections=%d rows=%d roadMeshRegistered=%s"),
+               Lines, RoadSectionClass.Num(), CachedRows.Num(),
+               (RoadMesh && RoadMesh->IsRegistered()) ? TEXT("yes") : TEXT("NO"));
+    }
+
+}
+
+void AMapViewActor::RedrawAll(float AltitudeM, bool bDataChanged)
+{
+    // -- 1. Ground + roads (ProceduralMesh ribbons) -------------------------
+    FlushPersistentDebugLines(GetWorld());
+
+    RebuildGroundPlane();
+
+    if (bDataChanged)
+        RebuildRoadMesh(AltitudeM);
+    else
+        ApplyRoadLod(AltitudeM);
+
+    // -- 2. Buildings. Buildings have no LOD classes, so a pure LOD change
+    //    must not re-triangulate them.
+    if (!bDataChanged) return;
+
     if (AltitudeM <= ShowBuildingsAltM)
         RebuildBuildingMesh();
     else
